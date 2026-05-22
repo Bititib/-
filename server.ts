@@ -14,11 +14,205 @@ const __dirname = path.dirname(__filename);
 
 const upload = multer({ dest: os.tmpdir(), limits: { fileSize: 150 * 1024 * 1024 } });
 
+// Initialize Gemini API
+const apiKey = process.env.GEMINI_API_KEY;
+if (!apiKey || apiKey === 'undefined' || apiKey.includes('MY_GEMINI_API_KEY')) {
+  console.error('GEMINI_API_KEY is not configured or invalid');
+}
+
+const ai = new GoogleGenAI({ 
+  apiKey: apiKey || '',
+  httpOptions: {
+    headers: {
+      'User-Agent': 'aistudio-build'
+    }
+  }
+});
+
 async function startServer() {
   const app = express();
   const PORT = 3000;
 
   app.use(express.json());
+
+  // Gemini API Endpoints
+  app.post('/api/modify-prompt', upload.single('file'), async (req, res) => {
+    try {
+      const file = req.file;
+      const { modifyPromptText } = req.body;
+
+      if (!file) {
+        return res.status(400).json({ error: 'No file uploaded' });
+      }
+
+      // Upload to Gemini
+      let uploadedFile = await ai.files.upload({
+        file: file.path,
+        config: {
+          mimeType: file.mimetype || 'image/jpeg',
+        }
+      });
+
+      while (uploadedFile.state === 'PROCESSING') {
+        await new Promise(resolve => setTimeout(resolve, 2000));
+        uploadedFile = await ai.files.get({ name: uploadedFile.name });
+      }
+
+      if (uploadedFile.state === 'FAILED') {
+        throw new Error('图片处理失败，请尝试其他图片。');
+      }
+
+      const response = await ai.models.generateContent({
+        model: 'gemini-1.5-flash',
+        contents: [
+          {
+            role: 'user',
+            parts: [
+              { text: modifyPromptText },
+              { fileData: { fileUri: uploadedFile.uri, mimeType: uploadedFile.mimeType } }
+            ]
+          }
+        ],
+        config: {
+          responseMimeType: 'application/json',
+          responseSchema: {
+            type: Type.OBJECT,
+            properties: {
+              reversePrompt: { type: Type.STRING },
+              reversePromptTranslation: { type: Type.STRING },
+            },
+            required: ['reversePrompt', 'reversePromptTranslation'],
+          },
+        },
+      });
+
+      // Cleanup
+      try {
+        await ai.files.delete({ name: uploadedFile.name });
+        fs.unlinkSync(file.path);
+      } catch (e) {
+        console.error('Cleanup error:', e);
+      }
+
+      res.json(JSON.parse(response.response.text()));
+    } catch (error: any) {
+      console.error('Modify prompt error:', error);
+      res.status(500).json({ error: error.message || 'Internal server error' });
+    }
+  });
+
+  app.post('/api/generate-image', async (req, res) => {
+    try {
+      const { prompt, aspectRatio, referenceImageBase64, referenceImageMimeType } = req.body;
+
+      let parts: any[] = [{ text: prompt }];
+
+      if (referenceImageBase64) {
+        parts = [
+          {
+            inlineData: {
+              data: referenceImageBase64,
+              mimeType: referenceImageMimeType || 'image/jpeg'
+            }
+          },
+          { text: `Using the provided image as the core product reference, generate a high-quality product photography scene in an Instagram lifestyle aesthetic (real photo, candid, natural lighting): ${prompt}` }
+        ];
+      }
+
+      const response = await ai.models.generateContent({
+        model: 'gemini-2.5-flash-image',
+        contents: {
+          parts: parts
+        },
+        config: {
+          imageConfig: {
+            aspectRatio: aspectRatio || "16:9"
+          }
+        }
+      });
+      
+      let imageUrl = null;
+      for (const part of response.candidates?.[0]?.content?.parts || []) {
+        if (part.inlineData) {
+          const base64EncodeString = part.inlineData.data;
+          imageUrl = `data:image/png;base64,${base64EncodeString}`;
+          break;
+        }
+      }
+
+      if (imageUrl) {
+        res.json({ imageUrl });
+      } else {
+        throw new Error('Failed to generate image');
+      }
+    } catch (error: any) {
+      console.error('Image generation error:', error);
+      res.status(500).json({ error: error.message || 'Internal server error' });
+    }
+  });
+
+  app.post('/api/analyze', upload.array('files'), async (req, res) => {
+    try {
+      const files = req.files as Express.Multer.File[];
+      const { prompt, responseSchema, model } = req.body;
+
+      if (!files || files.length === 0) {
+        return res.status(400).json({ error: 'No files uploaded' });
+      }
+
+      // Upload files to Gemini
+      const uploadedFiles = await Promise.all(files.map(async (file) => {
+        let uploaded = await ai.files.upload({
+          file: file.path,
+          config: { mimeType: file.mimetype }
+        });
+
+        while (uploaded.state === 'PROCESSING') {
+          await new Promise(resolve => setTimeout(resolve, 2000));
+          uploaded = await ai.files.get({ name: uploaded.name });
+        }
+
+        if (uploaded.state === 'FAILED') {
+          throw new Error(`File processing failed for ${file.originalname}`);
+        }
+        return uploaded;
+      }));
+
+      const modelName = model === 'gemini-2.5-flash-image' ? 'gemini-2.0-flash-exp' : 'gemini-1.5-flash';
+
+      const response = await ai.models.generateContent({
+        model: modelName,
+        contents: [
+          {
+            role: 'user',
+            parts: [
+              { text: prompt },
+              ...uploadedFiles.map(file => ({
+                fileData: { fileUri: file.uri, mimeType: file.mimeType }
+              }))
+            ]
+          }
+        ],
+        config: {
+          responseMimeType: 'application/json',
+          responseSchema: responseSchema ? JSON.parse(responseSchema) : undefined,
+        },
+      });
+
+      // Cleanup
+      try {
+        await Promise.all(uploadedFiles.map(file => ai.files.delete({ name: file.name })));
+        files.forEach(file => fs.unlinkSync(file.path));
+      } catch (e) {
+        console.error('Cleanup error:', e);
+      }
+
+      res.json(JSON.parse(response.response.text()));
+    } catch (error: any) {
+      console.error('Analysis error:', error);
+      res.status(500).json({ error: error.message || 'Internal server error' });
+    }
+  });
 
   app.post('/api/extract-video', async (req, res) => {
     const { url } = req.body;
@@ -29,10 +223,12 @@ async function startServer() {
       if (url.includes('tiktok.com') || url.includes('douyin.com')) {
         const tikwmRes = await fetch(`https://www.tikwm.com/api/?url=${encodeURIComponent(url)}`);
         const tikwmData = await tikwmRes.json();
-        if (tikwmData.data && tikwmData.data.play) {
+        if (tikwmData.data && tikwmData.data.images && tikwmData.data.images.length > 0) {
+          throw new Error('这是一个图文内容，不能作为视频导入。请尝试使用左侧的【图片逆向】或【电商文案】功能导入。');
+        } else if (tikwmData.data && tikwmData.data.play) {
           videoUrl = tikwmData.data.play;
         } else {
-          throw new Error('无法解析该 TikTok/Douyin 链接，请确保链接公开可用。');
+          throw new Error('无法解析该 TikTok/Douyin 链接，请确保链接公开可用且包含视频内容。');
         }
       } else if (url.includes('youtube.com') || url.includes('youtu.be')) {
          try {
@@ -217,6 +413,47 @@ async function startServer() {
 
     } catch (error: any) {
       console.error('Extraction error:', error);
+      res.status(500).json({ error: error.message });
+    }
+  });
+
+  app.post('/api/extract-account', async (req, res) => {
+    const { handle } = req.body;
+    try {
+      if (!handle) throw new Error('请输入账号名称');
+      
+      let uniqueId = handle.trim();
+      const match = uniqueId.match(/tiktok\.com\/@([^\/\?]+)/);
+      if (match) {
+        uniqueId = match[1];
+      } else {
+        uniqueId = uniqueId.replace(/^@/, '');
+      }
+
+      if (uniqueId.startsWith('http')) {
+        throw new Error('无法从该短链接提取账号，请直接输入 @账号名 (例如 @tiktok)');
+      }
+      
+      const tikwmRes = await fetch(`https://www.tikwm.com/api/user/info?unique_id=${encodeURIComponent(uniqueId)}`, {
+         headers: {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+         }
+      });
+      const data = await tikwmRes.json();
+      
+      if (data.code === 0 && data.data && data.data.stats) {
+        res.json({
+          videoCount: data.data.stats.videoCount,
+          followerCount: data.data.stats.followerCount,
+          heartCount: data.data.stats.heartCount,
+          nickname: data.data.user?.nickname || uniqueId,
+          avatar: data.data.user?.avatarLarger || data.data.user?.avatarMedium
+        });
+      } else {
+         throw new Error(data.msg || '无法获取该账号数据');
+      }
+    } catch (error: any) {
+      console.error('Account extraction error:', error);
       res.status(500).json({ error: error.message });
     }
   });
